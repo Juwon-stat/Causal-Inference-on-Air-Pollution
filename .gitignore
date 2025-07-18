@@ -1,0 +1,12 @@
+# R-specific
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# RStudio
+.Rproj.user/
+*.Rproj
+
+# Other
+.DS_Store
