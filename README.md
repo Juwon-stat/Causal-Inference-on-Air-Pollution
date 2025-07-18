@@ -4,5 +4,6 @@ Causal Inference on Long-Range Air Pollution: A Matching-Based Study of Seoul’
 - **seoul_q3.RData**: Data used for matching based on quantile grouping (Q3, ±3 days)
 - **seoul_q4.RData**: Data for Q4 matching window
 - **seoul_q5.RData**: Data for Q5 matching window
-% Each file contains:
+
+## Each seoul_q*.RData file contains data.frame named:
 - `seoul_q*`: Air pollution and weather data (2017–2023)
