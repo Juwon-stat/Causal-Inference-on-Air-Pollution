@@ -7,3 +7,36 @@ Causal Inference on Long-Range Air Pollution: A Matching-Based Study of Seoul’
 
 ## Each seoul_q*.RData file contains data.frame named:
 - `seoul_q*`: Air pollution and weather data (2017–2023)
+
+
+## 📂 Repository Structure
+This repository contains R code and materials for causal inference analysis of air pollution in Seoul, focusing on matching methods and balance diagnostics.
+
+Causal-Inference-on-Air-Pollution/
+├── R/
+│ ├── matching_code/ # Matching algorithms (PSM, CBPS, CEM)
+│ ├── smd_code/ # Standardized Mean Difference (SMD) summaries and panel plots
+│ └── README.md
+└── README.md
+
+## 🔎 Contents
+
+- **Matching codes**  
+  - Propensity Score Matching (PSM)  
+  - Covariate Balancing Propensity Score (CBPS)  
+  - Coarsened Exact Matching (CEM)  
+
+- **Balance diagnostics**  
+  - Standardized Mean Difference (SMD) calculation  
+  - Panel visualization (Love plots, 2×3 and 3×3 panels)  
+  - CSV exports of summarized balance tables  
+
+## ⚙️ Requirements
+- R (≥ 4.0)
+- Required R packages:
+  - `data.table`, `ggplot2`, `ggpubr`, `forcats`, `dplyr`, `tidyr`, `lubridate`
+
+## 🚀 Usage
+1. Run matching codes (`R/matching_code/`) to generate matched datasets.  
+2. Run SMD codes (`R/smd_code/`) to compute balance diagnostics and plots.  
+3. Combined 3×3 panel plots can be created to compare methods (CEM / PSM / CBPS).
