@@ -8,16 +8,7 @@ Causal Inference on Long-Range Air Pollution: A Matching-Based Study of Seoul’
 ## Each seoul_q*.RData file contains data.frame named:
 - `seoul_q*`: Air pollution and weather data (2017–2023)
 
-
-## 📂 Repository Structure
 This repository contains R code and materials for causal inference analysis of air pollution in Seoul, focusing on matching methods and balance diagnostics.
-
-Causal-Inference-on-Air-Pollution/
-├── R/
-│ ├── matching_code/ # Matching algorithms (PSM, CBPS, CEM)
-│ ├── smd_code/ # Standardized Mean Difference (SMD) summaries and panel plots
-│ └── README.md
-└── README.md
 
 ## 🔎 Contents
 
