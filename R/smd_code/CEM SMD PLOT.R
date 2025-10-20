@@ -1,6 +1,6 @@
 ###############################################################################
 # Title   : CEM Balance Diagnostics — Recompute SMDs + 2×3 Panels + CSV Exports
-# Author  : (Your Name)
+# Author  : Juwon Jung
 # Version : 1.0
 # Date    : 2025-08-19
 #
@@ -361,3 +361,4 @@ message("Backup directory: ", backup_dir)
 message("CSV(values) directory: ", csv_dir_values)
 message("CSV(tidy) directory:   ", csv_dir_tidy)
 if (SAVE_RAW_SMD_CSV) message("CSV(raw) directory: ", csv_dir_raw)
+
