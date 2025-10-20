@@ -1,6 +1,6 @@
 ###############################################################################
 # Title   : CBPS Balance Diagnostics — 2×3 Love-Plot Panels + CSV Exports
-# Author  : (Your Name)
+# Author  : Juwon Jung
 # Version : 1.1
 # Date    : 2025-08-19
 #
@@ -300,3 +300,4 @@ if (SAVE_CSV_TIDY && length(.all_tidy)) {
 message("CSV(values): ", csv_dir_values)
 message("CSV(tidy):   ", csv_dir_tidy)
 if (SAVE_RAW_SMD_CSV) message("CSV(raw): ", csv_dir_raw)
+
