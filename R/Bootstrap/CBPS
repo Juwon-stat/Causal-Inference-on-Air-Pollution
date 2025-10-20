@@ -1,1 +1,296 @@
+# ================================================================
+# Post-hoc SE/CI from saved CBPS bundles (NO re-matching)
+# - Loads RData bundles that contain TALL, CALL (and optionally att_over)
+# - Computes ATT point (if not present) and SE/CI via:
+#     (1) unit-level multiplier bootstrap (Exp/Gamma, mean = 1)
+#     (2) unit-level block bootstrap (cluster = rid)
+# - Appends results and re-saves an enriched RData + a CSV summary
+# ================================================================
+
+suppressPackageStartupMessages({
+  # data.table is optional; the script falls back to base R where possible.
+  ok <- requireNamespace("data.table", quietly = TRUE)
+  if (ok) library(data.table)
+})
+
+## ====================== USER SETTINGS ===========================
+# Directory containing existing CBPS RData bundles
+in_dir  <- "C:/Users/user/OneDrive - 고려대학교/바탕 화면/lockdown/Matching_Results/CBPS/dist"
+
+# Output directory for post-hoc SE/CI artifacts (RData + CSV)
+out_dir <- file.path(in_dir, "posthoc_se")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Input file name pattern (tweak if your naming differs)
+pattern_rdata <- "^cbps_UNIT_ATT_boot_.*_WITH_SMD_DIAG\\.RData$"
+
+# Bootstrap controls (set to 0 to skip a method)
+B_mult     <- 1000L   # multiplier bootstrap replications
+B_block    <- 1000L   # block (unit-level cluster) bootstrap replications
+SEED       <- 12345   # RNG seed for reproducibility
+MULT_ALPHA <- 1       # 1 => Exp(1); >1 => Gamma(shape=α, rate=α) with mean 1
+
+# Pollutant names (for readability only; columns are fixed by convention)
+pollutants <- c("PM10", "PM25")
+
+## ============================ HELPERS ============================
+is_dt <- function(x) inherits(x, "data.table")
+to_dt <- function(x) if (is_dt(x)) x else data.table::as.data.table(x)
+
+# Draw iid positive multipliers with mean = 1.
+# α = 1  => Exponential(1) (most variable)
+# α > 1  => Gamma(shape=α, rate=α), variance shrinks as α increases
+draw_multiplier <- function(n, alpha = 1) {
+  if (alpha == 1) rexp(n, rate = 1) else rgamma(n, shape = alpha, rate = alpha) # mean = 1
+}
+
+# ATT point estimate (Hájek ratio form):
+# ATT = (weighted control mean) - (treated mean)
+# where:
+#   control mean = sum(wY) / sum(w)
+#   treated mean = sum(Y)  / sum(N)
+compute_point_att <- function(TALL, CALL, y_col) {
+  # y_col must be "Y10" or "Y25"; control column is paste0("w", y_col)
+  num_c <- sum(CALL[[paste0("w", y_col)]], na.rm = TRUE)
+  den_c <- sum(CALL[["w"]],              na.rm = TRUE)
+  num_t <- sum(TALL[[y_col]],            na.rm = TRUE)
+  den_t <- sum(TALL[["N"]],              na.rm = TRUE)
+  if (!is.finite(den_c) || den_c <= 0 || !is.finite(den_t) || den_t <= 0) return(NA_real_)
+  (num_c / den_c) - (num_t / den_t)
+}
+
+# Unit-level multiplier bootstrap for ATT (clustered by rid):
+# - We draw multipliers m over unique rids and map them to TALL and CALL rows.
+# - We re-compute the Hájek form using reweighted sums:
+#     treated: sum(m_t * Y) / sum(m_t * N)
+#     control: sum(m_c * wY) / sum(m_c * w)
+# - Returns a numeric vector of bootstrap replicates.
+boot_multiplier <- function(TALL, CALL, rids, key_t, key_c, y_col, B = 1000L, alpha = 1) {
+  out <- numeric(B)
+  for (b in seq_len(B)) {
+    m   <- draw_multiplier(length(rids), alpha)
+    m_t <- m[key_t]  # map multipliers to treated rows
+    m_c <- m[key_c]  # map multipliers to control rows
+    num_t <- sum(m_t * TALL[[y_col]])
+    den_t <- sum(m_t * TALL[["N"]])
+    num_c <- sum(m_c * CALL[[paste0("w", y_col)]])
+    den_c <- sum(m_c * CALL[["w"]])
+    out[b] <- if (is.finite(den_t) && den_t > 0 && is.finite(den_c) && den_c > 0) {
+      (num_c / den_c) - (num_t / den_t)
+    } else NA_real_
+  }
+  out
+}
+
+# Unit-level block bootstrap (cluster resampling by rid):
+# - Resample rids with replacement to form a bootstrap population.
+# - Use the bootstrap frequency of each rid to scale its contributions.
+# - Returns a numeric vector of bootstrap replicates.
+boot_block <- function(TALL, CALL, rids, key_t, key_c, y_col, B = 1000L) {
+  out <- numeric(B)
+  R   <- length(rids)
+  for (b in seq_len(B)) {
+    samp <- sample.int(R, size = R, replace = TRUE)
+    freq <- tabulate(samp, nbins = R)  # frequency for each rid
+    f_t  <- freq[key_t]                # expand to treated rows
+    f_c  <- freq[key_c]                # expand to control rows
+    num_t <- sum(f_t * TALL[[y_col]])
+    den_t <- sum(f_t * TALL[["N"]])
+    num_c <- sum(f_c * CALL[[paste0("w", y_col)]])
+    den_c <- sum(f_c * CALL[["w"]])
+    out[b] <- if (is.finite(den_t) && den_t > 0 && is.finite(den_c) && den_c > 0) {
+      (num_c / den_c) - (num_t / den_t)
+    } else NA_real_
+  }
+  out
+}
+
+# Summarize bootstrap draws:
+# - Monte Carlo SD as a bootstrap-based SE
+# - 2.5% and 97.5% percentile CI
+# - Count of finite draws used
+summarize_boot <- function(draws) {
+  draws <- draws[is.finite(draws)]
+  if (!length(draws)) return(list(se = NA_real_, lo95 = NA_real_, hi95 = NA_real_, n = 0L))
+  qs <- stats::quantile(draws, c(.025, .975), names = FALSE)
+  list(se = stats::sd(draws), lo95 = qs[1], hi95 = qs[2], n = length(draws))
+}
+
+# -------- Analytic SE for a ratio R = A / B --------
+# Conditional SE (given data structure): Var(R | D) ≈ [ n * Var(a_i - R b_i) ] / B^2
+# where a_i, b_i are per-row contributions and n is the number of rows used.
+se_ratio_conditional <- function(a, b) {
+  A <- sum(a, na.rm = TRUE); B <- sum(b, na.rm = TRUE)
+  if (!is.finite(B) || B <= 0) return(NA_real_)
+  R <- A / B
+  z <- a - R * b
+  z <- z[is.finite(z)]
+  n <- length(z)
+  if (n <= 1) return(NA_real_)
+  sqrt( n * stats::var(z) / (B^2) )
+}
+
+# Unconditional SE (Delta method):
+# Var(R) ≈ (1/B^2) Var(A) - (2A/B^3) Cov(A,B) + (A^2/B^4) Var(B)
+se_ratio_unconditional <- function(a, b) {
+  A <- sum(a, na.rm = TRUE); B <- sum(b, na.rm = TRUE)
+  if (!is.finite(B) || B <= 0) return(NA_real_)
+  ok <- is.finite(a) & is.finite(b)
+  a  <- a[ok]; b <- b[ok]
+  n  <- length(a)
+  if (n <= 1) return(NA_real_)
+  Va  <- n * stats::var(a)     # Var(sum a_i)
+  Vb  <- n * stats::var(b)     # Var(sum b_i)
+  Cab <- n * stats::cov(a, b)  # Cov(sum a_i, sum b_i)
+  varR <- (Va / (B^2)) - (2 * A * Cab / (B^3)) + (A^2 * Vb / (B^4))
+  if (!is.finite(varR) || varR < 0) return(NA_real_)
+  sqrt(varR)
+}
+
+## ========================= MAIN LOOP OVER FILES ===========================
+set.seed(SEED)
+
+# Collect candidate bundles
+files <- list.files(in_dir, pattern = pattern_rdata, full.names = TRUE)
+if (!length(files)) stop("No RData bundle found under: ", in_dir)
+
+summary_rows <- list()
+
+for (f in files) {
+  message("Processing: ", basename(f))
+
+  # Load into a clean environment to avoid name collisions
+  e <- new.env(parent = emptyenv())
+  load(f, envir = e)
+  
+  # Sanity check for required objects
+  if (!all(c("TALL", "CALL") %in% ls(e))) { message("  -> SKIP: TALL/CALL not found."); next }
+  
+  TALL <- to_dt(e$TALL)
+  CALL <- to_dt(e$CALL)
+  
+  # Required columns:
+  # - Treated table TALL: rid, Y10, Y25, N
+  # - Control table CALL: rid, wY10, wY25, w
+  need_T <- c("rid", "Y10", "Y25", "N")
+  need_C <- c("rid", "wY10", "wY25", "w")
+  if (!all(need_T %in% names(TALL)) || !all(need_C %in% names(CALL))) {
+    message("  -> SKIP: required columns missing in ", basename(f)); next
+  }
+  
+  # Build rid universe and index keys to map multipliers/frequencies to rows
+  rids  <- sort(unique(c(TALL$rid, CALL$rid)))
+  key_t <- match(TALL$rid, rids)  # treated row -> rid index
+  key_c <- match(CALL$rid, rids)  # control row -> rid index
+  
+  # ---------------- Point estimates (ATT) ----------------
+  PM10_point <- compute_point_att(TALL, CALL, "Y10")
+  PM25_point <- compute_point_att(TALL, CALL, "Y25")
+  
+  # ---------------- Bootstrap (multiplier & block) ----------------
+  draws10_m <- boot_multiplier(TALL, CALL, rids, key_t, key_c, "Y10", B_mult,  MULT_ALPHA)
+  draws25_m <- boot_multiplier(TALL, CALL, rids, key_t, key_c, "Y25", B_mult,  MULT_ALPHA)
+  sm10_m    <- summarize_boot(draws10_m)
+  sm25_m    <- summarize_boot(draws25_m)
+  
+  draws10_b <- boot_block(TALL, CALL, rids, key_t, key_c, "Y10", B_block)
+  draws25_b <- boot_block(TALL, CALL, rids, key_t, key_c, "Y25", B_block)
+  sm10_b    <- summarize_boot(draws10_b)
+  sm25_b    <- summarize_boot(draws25_b)
+  
+  # ---------------- Analytic SE (conditional / unconditional) ----------------
+  # Treated side: ratio of sum(Y) / sum(N)
+  a_t_10 <- TALL$Y10;  b_t <- TALL$N
+  a_t_25 <- TALL$Y25
+  # Control side: ratio of sum(wY) / sum(w)
+  a_c_10 <- CALL$wY10; b_c <- CALL$w
+  a_c_25 <- CALL$wY25
+  
+  # Combine treated and control sides assuming independence across sides
+  se10_cond <- sqrt( se_ratio_conditional(a_c_10, b_c)^2 + se_ratio_conditional(a_t_10, b_t)^2 )
+  se25_cond <- sqrt( se_ratio_conditional(a_c_25, b_c)^2 + se_ratio_conditional(a_t_25, b_t)^2 )
+  se10_unco <- sqrt( se_ratio_unconditional(a_c_10, b_c)^2 + se_ratio_unconditional(a_t_10, b_t)^2 )
+  se25_unco <- sqrt( se_ratio_unconditional(a_c_25, b_c)^2 + se_ratio_unconditional(a_t_25, b_t)^2 )
+  
+  # 95% Normal CIs using analytic SEs
+  z975      <- stats::qnorm(0.975)
+  ci10_cond <- c(PM10_point - z975 * se10_cond, PM10_point + z975 * se10_cond)
+  ci25_cond <- c(PM25_point - z975 * se25_cond, PM25_point + z975 * se25_cond)
+  ci10_unco <- c(PM10_point - z975 * se10_unco, PM10_point + z975 * se10_unco)
+  ci25_unco <- c(PM25_point - z975 * se25_unco, PM25_point + z975 * se25_unco)
+  
+  # ---------------- Extract bootstrap summaries for saving ----------------
+  se10_mult  <- sm10_m$se
+  se25_mult  <- sm25_m$se
+  ci10_mult  <- c(sm10_m$lo95, sm10_m$hi95)
+  ci25_mult  <- c(sm25_m$lo95, sm25_m$hi95)
+  
+  se10_block <- sm10_b$se
+  se25_block <- sm25_b$se
+  ci10_block <- c(sm10_b$lo95, sm10_b$hi95)
+  ci25_block <- c(sm25_b$lo95, sm25_b$hi95)
+  
+  # ---------------- Assemble one-row CSV summary ----------------
+  row <- data.frame(
+    file        = basename(f),
+    region_var  = if ("region_var" %in% ls(e)) as.character(e$region_var) else NA_character_,
+    B_mult      = B_mult,
+    B_block     = B_block,
+    seed        = SEED,
+    mult_alpha  = MULT_ALPHA,
+    
+    PM10_point  = PM10_point,
+    PM25_point  = PM25_point,
+    
+    # Multiplier (percentile CI)
+    PM10_se_mult   = se10_mult, PM10_lo95_mult = ci10_mult[1], PM10_hi95_mult = ci10_mult[2], PM10_n_mult = sm10_m$n,
+    PM25_se_mult   = se25_mult, PM25_lo95_mult = ci25_mult[1], PM25_hi95_mult = ci25_mult[2], PM25_n_mult = sm25_m$n,
+    
+    # Block bootstrap (percentile CI)
+    PM10_se_block  = se10_block, PM10_lo95_block = ci10_block[1], PM10_hi95_block = ci10_block[2], PM10_n_block = sm10_b$n,
+    PM25_se_block  = se25_block, PM25_lo95_block = ci25_block[1], PM25_hi95_block = ci25_block[2], PM25_n_block = sm25_b$n,
+    
+    # Analytic (normal-approx CIs; for reference/appendix)
+    PM10_se_cond   = se10_cond, PM10_lo95_cond = ci10_cond[1], PM10_hi95_cond = ci10_cond[2],
+    PM25_se_cond   = se25_cond, PM25_lo95_cond = ci25_cond[1], PM25_hi95_cond = ci25_cond[2],
+    PM10_se_uncond = se10_unco, PM10_lo95_uncond = ci10_unco[1], PM10_hi95_uncond = ci10_unco[2],
+    PM25_se_uncond = se25_unco, PM25_lo95_uncond = ci25_unco[1], PM25_hi95_uncond = ci25_unco[2],
+    stringsAsFactors = FALSE
+  )
+  summary_rows[[length(summary_rows) + 1L]] <- row
+  
+  # ---------------- Save enriched bundle ----------------
+  out_rdata <- file.path(out_dir, sub("\\.RData$", "_POSTSE.RData", basename(f)))
+  att_over  <- if ("att_over" %in% ls(e)) e$att_over else NULL
+  
+  to_save <- c(
+    # original core objects
+    "TALL","CALL","att_over",
+    # points
+    "PM10_point","PM25_point",
+    # multiplier draws & summaries
+    "draws10_m","draws25_m","se10_mult","se25_mult","ci10_mult","ci25_mult","B_mult","MULT_ALPHA",
+    # block draws & summaries
+    "draws10_b","draws25_b","se10_block","se25_block","ci10_block","ci25_block","B_block",
+    # analytic SE/CI
+    "se10_cond","se25_cond","ci10_cond","ci25_cond",
+    "se10_unco","se25_unco","ci10_unco","ci25_unco"
+  )
+  save(list = to_save, file = out_rdata)
+}
+
+# ---------------- Write overall CSV summary ----------------
+summary_dt <- if (length(summary_rows)) do.call(rbind, summary_rows) else data.frame()
+out_csv    <- file.path(out_dir, "POSTHOC_ATT_SE_summary_dist.csv")
+
+if (nrow(summary_dt)) {
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    data.table::fwrite(summary_dt, out_csv)
+  } else {
+    write.csv(summary_dt, out_csv, row.names = FALSE)
+  }
+  message("Saved summary CSV: ", out_csv)
+} else {
+  message("No files processed; summary CSV not created.")
+}
 
