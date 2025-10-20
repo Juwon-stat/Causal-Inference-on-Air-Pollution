@@ -1,7 +1,7 @@
 ###############################################################################
 # Title   : Block-wise Exact Matching (±k days) with Temperature tq/rt option
 #           + Post-match Balance (SMD) + Outcome Differences (Control − Treat)
-# Author  : (Your Name)
+# Author  : Juwon Jung
 # Version : 1.1
 # Date    : 2025-08-19
 #
@@ -282,3 +282,4 @@ for (q in names(seoul_list)) {
     } # day_window
   }   # unit_tag
 }     # q
+
