@@ -1,6 +1,6 @@
 ###############################################################################
 # Title   : Combined SMD Panels (3×3) — CEM vs PSM vs CBPS by Window
-# Author  : (Your Name)
+# Author  : Juwon Jung
 # Version : 1.0
 # Date    : 2025-08-19
 #
@@ -37,11 +37,12 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(forcats)
   library(ggpubr)
+  library(ggtext)   
+  library(grid)     
 })
 
 ## ============================== USER PATHS =================================
-# Change only `root` to point to your Matching_Results folder.
-root      <- "C:/path/to/Matching_Results"
+root      <- "Your Path"
 cem_dir   <- file.path(root, "CEM")
 psm_dir   <- file.path(root, "PSM")
 cbps_dir  <- file.path(root, "CBPS")
@@ -49,7 +50,6 @@ out_dir   <- file.path(root, "Combined_Panels_3x3_by_q")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 ## ========================== MASTER CSV FILENAMES ===========================
-# Master CSV naming conventions for each method:
 cem_master  <- function(unit)
   file.path(cem_dir,  sprintf("SMD_values_master_%s.csv", unit))
 
@@ -68,19 +68,25 @@ methods   <- c("CEM","PSM","CBPS")
 units     <- c("rt","tq")
 regions   <- c("dist","area")
 qs        <- c("q3","q4","q5")
-DATE_AGG  <- "weighted_mean"   # must match how PSM/CBPS master CSVs were saved
+DATE_AGG  <- "weighted_mean"
 
 ## ================================ STYLING ==================================
-TEXT_Y_SIZE <- 14         # y-axis (variable label) size
-DOT_SIZE    <- 3.6        # point size
-LEGEND_TEXT_SIZE   <- 20  # legend font size
-LEGEND_DOT_SIZE    <- 4.5 # legend point override size
-LEGEND_KEY_SIZE_PT <- 24  # legend key box size in points
-LABEL_APPEND_WINDOW <- FALSE  # if TRUE, append "; ±k" to temp/CO/O3 labels
+TEXT_Y_SIZE <- 14
+DOT_SIZE    <- 3.6
+LEGEND_TEXT_SIZE   <- 20
+LEGEND_DOT_SIZE    <- 4.5
+LEGEND_KEY_SIZE_PT <- 24
+LABEL_APPEND_WINDOW <- FALSE
+
+METHOD_TITLE_PT <- 18  
+make_panel_title <- function(method, w){
+  sprintf(
+    "<span style='font-size:%dpt; font-weight:700'>%s</span> — ±%d-day Time Window",
+    METHOD_TITLE_PT, method, w
+  )
+}
 
 ## =============================== LABEL HELPERS =============================
-# Label mapper for aggregated variables; temp label depends on unit (rt/tq),
-# CO/O3 always annotated with (quantiled = N).
 label_vars_agg <- function(v, temp_mode = c("rt","tq"), q_tag = NULL, d_win = NULL){
   temp_mode <- match.arg(temp_mode)
   q_num <- if (!is.null(q_tag)) as.integer(sub("^q","", q_tag)) else NA_integer_
@@ -89,15 +95,10 @@ label_vars_agg <- function(v, temp_mode = c("rt","tq"), q_tag = NULL, d_win = NU
   suf_qw <- paste0(qsuf, wsuf)
   
   v <- as.character(v)
-  # Temperature: rt=rounded, tq=quantiled
   v[v %in% c("temp_match","temp_quantile","temp")] <-
     if (temp_mode == "rt") "Temperature (rounded)" else paste0("Temperature", suf_qw)
-  
-  # CO/O3 always show quantiled label
   v[v %in% c("CO_quantile","CO")] <- paste0("CO",  suf_qw)
   v[v %in% c("O3_quantile","O3")] <- paste0("O3",  suf_qw)
-  
-  # Other covariates
   v[v == "wind_sp_binary"] <- "Wind speed (binary)"
   v[v == "rain_binary"]    <- "Precipitation occurrence"
   v[v == "time_of_day"]    <- "Time of day"
@@ -111,7 +112,6 @@ label_vars_agg <- function(v, temp_mode = c("rt","tq"), q_tag = NULL, d_win = NU
 pretty_region <- function(r) if (r == "dist") "Administrative Districts" else "Residential Zones"
 
 ## ============================== MASTER LOADER ==============================
-# Read a method’s master CSV for a given unit; validate required columns.
 load_master <- function(method, unit){
   f <- switch(method,
               "CEM"  = cem_master(unit),
@@ -127,8 +127,6 @@ load_master <- function(method, unit){
 }
 
 ## ============================= CELL DATA BUILDER ===========================
-# Within fixed q, build the per-cell variable table: per variable, keep the
-# maximum |SMD| over levels already pre-aggregated by upstream scripts.
 make_cell_var_df <- function(master_dt, region_val, unit_val, win_val, q_tag){
   sub <- master_dt[region == region_val & unit == unit_val & d_win == win_val & q == q_tag]
   if (nrow(sub) == 0) return(NULL)
@@ -137,10 +135,12 @@ make_cell_var_df <- function(master_dt, region_val, unit_val, win_val, q_tag){
 }
 
 ## ================================ LOVE PLOT ================================
-# Minimal black/white love-plot: Before = open circle, After = filled circle.
 build_love_plot <- function(var_df, title_text, temp_mode, q_tag, xlim_max, d_win = NULL){
   if (is.null(var_df) || !nrow(var_df)) {
-    return(ggplot() + theme_void() + labs(title = paste0(title_text, " (missing)")))
+    return(
+      ggplot() + theme_void() + labs(title = paste0(title_text, " (missing)")) +
+        theme(plot.title = ggtext::element_markdown())
+    )
   }
   df_long <- melt(copy(var_df), id.vars = "variable",
                   measure.vars = c("before","after"),
@@ -173,16 +173,14 @@ build_love_plot <- function(var_df, title_text, temp_mode, q_tag, xlim_max, d_wi
       panel.grid.major.y= element_blank(),
       axis.text.y       = element_text(size = TEXT_Y_SIZE, face = "bold"),
       plot.background   = element_rect(fill = "white", color = NA),
-      panel.background  = element_rect(fill = "white", color = NA)
+      panel.background  = element_rect(fill = "white", color = NA),
+      plot.title        = ggtext::element_markdown()
     )
 }
 
 ## ================================ MAIN LOOP ================================
-# For each region × unit × q, create one 3×3 panel PNG.
 for (reg in regions) {
   for (unit in units) {
-    
-    # Load all methods’ master tables for this unit
     cem  <- load_master("CEM",  unit)
     psm  <- load_master("PSM",  unit)
     cbps <- load_master("CBPS", unit)
@@ -191,7 +189,6 @@ for (reg in regions) {
     for (q_tag in qs) {
       cell_var <- list(); xmax <- 0
       
-      # Prepare each cell’s data and track shared x-axis bound
       for (m in methods) {
         for (w in wins) {
           key <- paste(m, w, sep = "_")
@@ -205,14 +202,12 @@ for (reg in regions) {
       }
       if (!is.finite(xmax) || xmax <= 0) xmax <- 0.2
       
-      # Small helper to render each subplot with consistent scale
       mk <- function(m, w){
-        title <- sprintf("%s — ±%d Time Window", m, w)
+        ttl <- make_panel_title(m, w)  
         build_love_plot(cell_var[[paste(m, w, sep = "_")]],
-                        title, temp_mode = unit, q_tag = q_tag, xlim_max = xmax, d_win = w)
+                        ttl, temp_mode = unit, q_tag = q_tag, xlim_max = xmax, d_win = w)
       }
       
-      # 3×3 assembly: rows = CEM/PSM/CBPS; cols = 3/7/14
       p11 <- mk("CEM",3);  p12 <- mk("CEM",7);  p13 <- mk("CEM",14)
       p21 <- mk("PSM",3);  p22 <- mk("PSM",7);  p23 <- mk("PSM",14)
       p31 <- mk("CBPS",3); p32 <- mk("CBPS",7); p33 <- mk("CBPS",14)
@@ -222,17 +217,17 @@ for (reg in regions) {
         p21, p22, p23,
         p31, p32, p33,
         ncol = 3, nrow = 3,
-        labels = LETTERS[1:9],
         font.label   = list(size = 14, face = "bold"),
         common.legend = TRUE, legend = "right",
         align = "hv"
       )
       
       out_png <- file.path(out_dir, sprintf("SMD_3x3_%s_%s_%s.png", reg, unit, q_tag))
-      ggsave(out_png, panel, width = 20, height = 14, units = "in", dpi = 1200, bg = "white")
+      ggsave(out_png, panel, width = 20, height = 14, units = "in", dpi = 600, bg = "white")
       message("Saved: ", out_png,
               "  (", if (reg == "dist") "Administrative Districts" else "Residential Zones",
               ", unit=", unit, ", q=", q_tag, ")")
     }
   }
 }
+
