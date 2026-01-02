@@ -1,0 +1,172 @@
+###############################################################################
+# Title   : Summarize CEM ATT with Conventional Bootstrap (treated-unit resample)
+# Author  : Juwon Jung
+# Purpose :
+#   - Read multiple CEM output .RData files (each containing final_matched_df)
+#   - Compute ATT and bootstrap SE / percentile CI for PM10_diff and PM25_diff
+#   - Export a single CSV table for manuscript tables
+#
+# Notes :
+#   - This implements a "treated-unit bootstrap":
+#       1) Within each treated unit (id_var = target_index),
+#          average the matched control diffs (treated == 0).
+#       2) ATT = mean of these treated-unit averages.
+#       3) Bootstrap by resampling treated units (with replacement).
+#   - This matches your existing estimator definition in the code you found.
+###############################################################################
+
+###############################################################################
+# 0) Packages
+###############################################################################
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tibble)
+})
+
+###############################################################################
+# 1) User settings (EDIT HERE)
+###############################################################################
+
+# Directory containing CEM .RData outputs (each should have `final_matched_df`)
+cem_dir <- "C:/path/to/lockdown/CEM"   # <-- CHANGE THIS
+
+# Output CSV path
+out_csv <- "C:/path/to/lockdown/CEM/cem_table.csv"  # <-- CHANGE THIS
+
+# Bootstrap settings
+n_boot <- 1000
+conf_level <- 0.95
+
+# Column names used in your saved objects
+id_var <- "target_index"  # treated unit id
+treat_flag_var <- "treated"
+
+# Diff variables to summarize
+diff_vars <- c("PM10_diff", "PM25_diff")
+
+###############################################################################
+# 2) Bootstrap ATT function (treated-unit bootstrap)
+###############################################################################
+bootstrap_att <- function(data,
+                          diff_var,
+                          id_var = "target_index",
+                          treat_flag_var = "treated",
+                          n_boot = 1000,
+                          conf_level = 0.95) {
+
+  # --------------------------------------------------------------------------
+  # Step A: build treated-unit level means of matched control diffs
+  #   - your final_matched_df has treated==0 rows = matched controls
+  #   - each control row has a target_index pointing to its treated unit
+  # --------------------------------------------------------------------------
+  per_treated <- data %>%
+    filter(.data[[treat_flag_var]] == 0) %>%
+    group_by(.data[[id_var]]) %>%
+    summarise(
+      d_bar = mean(.data[[diff_var]], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Point estimate: mean of treated-unit averages
+  att_hat <- mean(per_treated$d_bar, na.rm = TRUE)
+
+  # --------------------------------------------------------------------------
+  # Step B: bootstrap by resampling treated units WITH replacement
+  # --------------------------------------------------------------------------
+  boot_means <- replicate(n_boot, {
+    samp <- per_treated %>% sample_frac(size = 1, replace = TRUE)
+    mean(samp$d_bar, na.rm = TRUE)
+  })
+
+  alpha <- 1 - conf_level
+  ci_lo <- as.numeric(quantile(boot_means, alpha / 2, na.rm = TRUE))
+  ci_hi <- as.numeric(quantile(boot_means, 1 - alpha / 2, na.rm = TRUE))
+
+  # Return a one-row tibble
+  tibble(
+    variable     = diff_var,
+    ATT_estimate = round(att_hat, 4),
+    bootstrap_sd = round(sd(boot_means, na.rm = TRUE), 4),
+    CI           = sprintf("(%.4f, %.4f)", ci_lo, ci_hi)
+  )
+}
+
+###############################################################################
+# 3) Read CEM .RData files and summarize
+###############################################################################
+
+# List .RData files
+cem_files <- list.files(cem_dir, pattern = "\\.RData$", full.names = TRUE)
+
+if (length(cem_files) == 0) {
+  stop("No .RData files found in: ", cem_dir)
+}
+
+all_results <- list()
+
+for (file in cem_files) {
+
+  # --------------------------------------------------------------------------
+  # Keep track of objects in the environment so we can clean up safely
+  # (prevents objects from one file leaking into the next iteration)
+  # --------------------------------------------------------------------------
+  before_objs <- ls()
+
+  # Load .RData (expected to create `final_matched_df` among others)
+  load(file)
+
+  # Validate object existence
+  if (!exists("final_matched_df")) {
+    warning("`final_matched_df` not found in: ", basename(file))
+    rm(list = setdiff(ls(), before_objs))
+    next
+  }
+
+  # Validate required columns
+  need_cols <- c(diff_vars, treat_flag_var, id_var)
+  if (!all(need_cols %in% colnames(final_matched_df))) {
+    warning("Missing required columns in: ", basename(file),
+            " | Missing: ", paste(setdiff(need_cols, colnames(final_matched_df)), collapse = ", "))
+    rm(list = setdiff(ls(), before_objs))
+    next
+  }
+
+  # Count matched control rows (treated == 0)
+  n_control <- sum(final_matched_df[[treat_flag_var]] == 0, na.rm = TRUE)
+
+  # Compute bootstrap summaries for each diff variable
+  res <- map_dfr(diff_vars, ~ bootstrap_att(
+    data = final_matched_df,
+    diff_var = .x,
+    id_var = id_var,
+    treat_flag_var = treat_flag_var,
+    n_boot = n_boot,
+    conf_level = conf_level
+  )) %>%
+    mutate(
+      file = basename(file),
+      sample_size = n_control
+    )
+
+  all_results[[length(all_results) + 1]] <- res
+
+  # Clean up objects loaded from this file (keep only the previous environment)
+  rm(list = setdiff(ls(), before_objs))
+}
+
+###############################################################################
+# 4) Combine results and export CSV
+###############################################################################
+final_df <- bind_rows(all_results) %>%
+  select(file, variable, sample_size, ATT_estimate, bootstrap_sd, CI)
+
+print(final_df)
+
+# Create output directory if needed
+out_dir <- dirname(out_csv)
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(final_df, out_csv, row.names = FALSE)
+
+message("[Saved] ", out_csv)
