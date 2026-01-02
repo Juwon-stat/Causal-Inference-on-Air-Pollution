@@ -1,0 +1,26 @@
+# CEM Conventional Bootstrap Summary
+
+This repository script summarizes CEM (Coarsened Exact Matching) results saved as `.RData` files and produces a single CSV table of ATT estimates, bootstrap standard errors, and percentile confidence intervals.
+
+## What this script does
+
+For each CEM output file (`.RData`) that contains `final_matched_df`:
+
+1. **Uses matched controls only** (`treated == 0`).
+2. Computes, for each treated unit (`target_index`), the mean of the matched control-minus-treated outcome differences:
+   - `PM10_diff = PM10_control - PM10_treated`
+   - `PM25_diff = PM25_control - PM25_treated`
+3. Defines the ATT as the **mean of treated-unit averages**.
+4. Runs a **treated-unit bootstrap**:
+   - resamples treated units (`target_index`) with replacement
+   - recomputes the ATT for each bootstrap replication
+5. Outputs:
+   - `ATT_estimate`
+   - `bootstrap_sd`
+   - percentile 95% CI
+
+This matches the estimator structure used in the original analysis code: treat each treated date/unit as the resampling unit, rather than resampling individual matched rows.
+
+
+
+
