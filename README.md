@@ -1,5 +1,5 @@
 # Causal-Inference-on-Air-Pollution
-Causal Inference on Transboundary Air Pollution]{Causal Inference on Transboundary Air Pollution: Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality
+Causal Inference on Transboundary Air Pollution: Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality
 
 - **seoul_q3.RData**: Data used for matching based on quantile grouping (Q3, ±3 days)
 - **seoul_q4.RData**: Data for Q4 matching window
