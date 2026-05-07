@@ -1,4 +1,4 @@
-# Causal-Inference-on-Air-Pollution
+# Block-wise Intertemporal Matching
 Causal Inference on Transboundary Air Pollution: Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality
 
 - **seoul_q3.RData**: Data used for matching based on quantile grouping (3-quantile)
