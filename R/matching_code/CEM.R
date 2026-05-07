@@ -1,285 +1,818 @@
 ###############################################################################
-# Title   : Block-wise Exact Matching (±k days) with Temperature tq/rt option
-#           + Post-match Balance (SMD) + Outcome Differences (Control − Treat)
-# Author  : Juwon Jung
-# Version : 1.1
-# Date    : 2025-08-19
+# Title   : CEM_GLOBAL.R
+# Purpose : Block-wise Coarsened Exact Matching (CEM)
+#           + treated-level ATT
+#           + conventional bootstrap
+#           + SMD diagnostics
 #
-# Purpose :
-#   - For each combination of {quantile version q ∈ {q3,q4,q5}, unit_tag ∈ {tq,rt},
-#     day_window ∈ {3,7,14}}, perform block-wise exact matching:
-#       * Treated: dates between start_date and end_date in year 2020
-#       * Controls: same calendar month-day within ±k days, years ≠ 2020,
-#         same spatial unit (region_var), and exact equality on core covariates.
-#       * Temperature handling:
-#           - "tq": match on temp_quantile
-#           - "rt": match on round(temp)
-#   - Compute Control − Treat differences for PM10/PM25 per matched control row.
-#   - Compute SMDs (before vs after matching) on categorical covariates via
-#     dummy coding; store all diagnostics and matched datasets.
+# Design  : Matches Algorithm 1 in the manuscript:
+#           for q in {3,4,5}, d in {3,7,14},
+#           for each treated observation i,
+#           find controls j with |t_j - t_i| <= d and year(j) != 2020,
+#           then exact match on coarsened covariates X_i^(q) = X_j^(q).
 #
-# Notes   :
-#   - This is a *deterministic exact-matching* routine (not propensity-based).
-#   - Variables used for exact matching will often have SMD≈0 after matching
-#     by construction. That is expected and indicates design-based balance.
-#
-# Inputs  :
-#   - RData files with pre-processed lists (one per quantile scheme):
-#       seoul_q3.RData  (object: seoul_q3)
-#       seoul_q4.RData  (object: seoul_q4)
-#       seoul_q5.RData  (object: seoul_q5)
-#     Each object must include at least:
-#       date (Date), year, month, day, hour,
-#       PM10, PM25, temp, temp_quantile,
-#       rain_binary, wind_sp_binary, wind_dir_8, time_of_day,
-#       CO_quantile, O3_quantile, wday,
-#       area (5 zones) and dist (25 districts).
-#
-# Outputs :
-#   - RData per combo: "cem_{region_var}_{unit_tag}_{q}_d{day_window}.RData"
-#       containing: matched_df (controls only with attached target), final_matched_df
-#       (controls + matched treated), smd_before, smd_after,
-#       and simple ATT-like summaries (att_mean10/25, att_sd10/25).
-#   - Optional CSV exports for SMDs can be added if desired.
+# Important:
+#           - Observational unit: district-date-hour record
+#           - Matching temporal covariate: coarsened time_of_day, not exact hour
+#           - Temperature matching covariate: temp_round = round(temp)
 ###############################################################################
 
 suppressPackageStartupMessages({
-  library(dplyr)
   library(data.table)
-  library(lubridate)
-  library(progress)
-  library(ggplot2)
 })
 
-## ============================== USER PATHS =================================
-# Replace with your own directories.
-root_in   <- "C:/path/to/Seoul_RData"    # where seoul_q3/4/5.RData live
-root_out  <- "C:/path/to/ExactMatch_Out" # where outputs will be saved
-dir.create(root_out, recursive = TRUE, showWarnings = FALSE)
+# =============================================================================
+# 0. USER CONFIGURATION
+# =============================================================================
 
-## ============================= GLOBAL SETTINGS =============================
-# Load pre-processed datasets (one object per file)
-load(file.path(root_in, "seoul_q3.RData"))  # provides object `seoul_q3`
-load(file.path(root_in, "seoul_q4.RData"))  # provides object `seoul_q4`
-load(file.path(root_in, "seoul_q5.RData"))  # provides object `seoul_q5`
+cfg <- list(
+  # Folder containing seoul_q3.RData, seoul_q4.RData, seoul_q5.RData
+  root_in  = "C:/path/to/Seoul_RData",
 
-seoul_list   <- list(q3 = seoul_q3, q4 = seoul_q4, q5 = seoul_q5)
+  # Output folder
+  root_out = "C:/path/to/CEM_results",
 
-unit_tags    <- c("tq", "rt")           # tq = temp_quantile; rt = rounded temperature
-day_windows  <- c(3, 7, 14)             # symmetric windows (±k days)
-region_var   <- "area"                  # "area" (5 zones) or "dist" (25 districts)
-start_date   <- as.Date("2020-01-24")   # treatment start (lockdown)
-end_date     <- as.Date("2020-02-09")   # treatment end
+  # O3 and CO quantile specifications
+  q_values = c(3, 4, 5),
 
-# Filename prefix (kept as 'cem_' for pipeline compatibility; change as needed)
-file_prefix  <- "cem"
+  # Time windows in days
+  day_windows = c(3, 7, 14),
 
-## ================================ HELPERS ==================================
-# Build a dummy (0/1) design matrix for categorical balance diagnostics.
-# Numeric binaries are auto-treated as factors to ensure proper dummy coding.
-get_dummy_matrix <- function(df, vars) {
-  vars <- intersect(vars, names(df))
-  if (!length(vars)) return(data.frame())
-  df_local <- df[, vars, drop = FALSE]
-  df_local[] <- lapply(df_local, function(x) {
-    # Convert to factor for consistent dummy creation (binary/ordinal ok)
-    if (is.factor(x)) x else as.factor(x)
-  })
-  form <- as.formula(paste("~", paste(vars, collapse = " + ")))
-  mm <- model.matrix(form, data = df_local)
-  # Drop intercept if present
-  if (colnames(mm)[1] == "(Intercept)") mm <- mm[, -1, drop = FALSE]
-  as.data.frame(mm, stringsAsFactors = FALSE)
+  # Spatial specifications
+  # Main analysis: "dist"
+  # Residential-zone sensitivity: "area"
+  region_vars = c("dist", "area"),
+
+  # Treatment period
+  treatment_start = as.Date("2020-01-24"),
+  treatment_end   = as.Date("2020-02-09"),
+  treatment_year  = 2020L,
+
+  # Bootstrap
+  B = 1000L,
+  seed = 20260507L,
+
+  # Outcomes
+  outcomes = c("PM10", "PM25"),
+
+  # Save full matched object?
+  save_full_rds = TRUE
+)
+
+dir.create(cfg$root_out, recursive = TRUE, showWarnings = FALSE)
+
+# =============================================================================
+# 1. HELPER FUNCTIONS
+# =============================================================================
+
+stop_if_missing <- function(DT, vars, data_name = "data") {
+  missing_vars <- setdiff(vars, names(DT))
+  if (length(missing_vars) > 0) {
+    stop(
+      sprintf(
+        "[%s] Missing required variables: %s",
+        data_name,
+        paste(missing_vars, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
 }
 
-# Standardized Mean Difference for numeric columns x1, x2
-diff_smd <- function(x1, x2) {
-  m1 <- mean(x1, na.rm = TRUE); m2 <- mean(x2, na.rm = TRUE)
-  s1 <- stats::sd(x1, na.rm = TRUE); s2 <- stats::sd(x2, na.rm = TRUE)
-  sp <- sqrt((s1^2 + s2^2) / 2)
-  if (!is.finite(sp) || sp == 0) return(NA_real_)
-  (m1 - m2) / sp
+safe_as_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  as.Date(x)
 }
 
-# Safe mean/SD for vectors with NAs
-smean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
-ssd   <- function(x) if (all(is.na(x))) NA_real_ else stats::sd(x, na.rm = TRUE)
+make_month_day_window <- function(date_i, d) {
+  format(seq(date_i - d, date_i + d, by = "day"), "%m-%d")
+}
 
-## =============================== MAIN LOOP =================================
-for (q in names(seoul_list)) {
-  seoul <- seoul_list[[q]]
-  # Light coercions & checks
-  seoul$date <- as.Date(seoul$date)
-  if (!("wday" %in% names(seoul))) stop("`wday` must exist in input data.")
-  if (!(region_var %in% names(seoul))) stop(sprintf("`%s` not found in data.", region_var))
-  
-  # Predefine covariates used in exact matching / SMD
-  covariates_all <- c("temp_quantile", "rain_binary", "CO_quantile", "O3_quantile",
-                      "wind_sp_binary", "wind_dir_8", "wday", "time_of_day")
-  
-  for (unit_tag in unit_tags) {
-    for (day_window in day_windows) {
-      
-      # --------------------- Define treated/control pools --------------------
-      target_data     <- seoul %>% filter(date >= start_date & date <= end_date)
-      comparison_data <- seoul %>% filter(!(date >= start_date & date <= end_date))
-      
-      if (!nrow(target_data) || !nrow(comparison_data)) next
-      
-      # Progress bar
-      pb <- progress::progress_bar$new(total = nrow(target_data),
-                                       format = "[:bar] :percent eta: :eta  (q={q} {unit_tag} ±{k}d)")
-      pb$tick(0, tokens = list(q = q, unit_tag = unit_tag, k = day_window))
-      
-      matching_results <- vector("list", nrow(target_data))  # per treated row controls
-      
-      # ====================== Block-wise exact matching ======================
-      for (i in seq_len(nrow(target_data))) {
-        target_row <- target_data[i, , drop = FALSE]
-        
-        # ±k days window by month-day (e.g., "01-25"), independent of year
-        date_seq_md <- format(seq(target_row$date - days(day_window),
-                                  target_row$date + days(day_window), by = "day"), "%m-%d")
-        
-        # Base exact constraints (excluding temperature at this step)
-        base_match <- comparison_data %>%
-          filter(format(date, "%m-%d") %in% date_seq_md,
-                 .data[["time_of_day"]] == target_row$time_of_day,
-                 .data[[region_var]]    == target_row[[region_var]],
-                 wday            == target_row$wday,
-                 CO_quantile     == target_row$CO_quantile,
-                 O3_quantile     == target_row$O3_quantile,
-                 wind_sp_binary  == target_row$wind_sp_binary,
-                 wind_dir_8      == target_row$wind_dir_8,
-                 rain_binary     == target_row$rain_binary)
-        
-        # Temperature matching mode
-        matched_data <-
-          if (unit_tag == "tq") {
-            base_match %>% filter(temp_quantile == target_row$temp_quantile)
-          } else {
-            base_match %>% filter(round(temp) == round(target_row$temp))
-          }
-        
-        # Keep if any controls found
-        if (nrow(matched_data) > 0) {
-          matched_data$matched_index <- seq_len(nrow(matched_data))  # per-target ranking (optional)
-          matched_data$target_index  <- i
-          matching_results[[i]] <- matched_data
-        }
-        
-        pb$tick(tokens = list(q = q, unit_tag = unit_tag, k = day_window))
-      } # end treated loop
-      
-      # Skip if no matches at all
-      non_empty <- which(lengths(matching_results) > 0L)
-      if (!length(non_empty)) next
-      
-      # Merge all matched controls
-      matched_df <- data.table::rbindlist(matching_results[non_empty], use.names = TRUE, fill = TRUE)
-      
-      # Attach treated outcomes to each matched control row (for differences)
-      target_data_labeled <- target_data %>% mutate(treated = 1L, target_index = row_number())
-      setDT(matched_df)
-      matched_df <- merge(
-        matched_df,
-        target_data_labeled[, .(target_index, PM10_target = PM10, PM25_target = PM25)],
-        by = "target_index",
-        all.x = TRUE
+weighted_mean <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  sum(w[ok] * x[ok]) / sum(w[ok])
+}
+
+weighted_var <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  mu <- weighted_mean(x[ok], w[ok])
+  sum(w[ok] * (x[ok] - mu)^2) / sum(w[ok])
+}
+
+smd_binary_weighted <- function(x_t, w_t, x_c, w_c) {
+  mt <- weighted_mean(x_t, w_t)
+  mc <- weighted_mean(x_c, w_c)
+  vt <- weighted_var(x_t, w_t)
+  vc <- weighted_var(x_c, w_c)
+
+  sp <- sqrt((vt + vc) / 2)
+
+  if (!is.finite(sp) || sp == 0) {
+    if (is.finite(mt) && is.finite(mc) && abs(mt - mc) < .Machine$double.eps) {
+      return(0)
+    } else {
+      return(NA_real_)
+    }
+  }
+
+  abs(mt - mc) / sp
+}
+
+compute_smd_categorical <- function(treated_dt,
+                                    control_dt,
+                                    covariates,
+                                    treated_weight_col = "smd_weight",
+                                    control_weight_col = "smd_weight",
+                                    label = "after") {
+  out <- list()
+
+  for (v in covariates) {
+    if (!(v %in% names(treated_dt)) || !(v %in% names(control_dt))) next
+
+    xt <- as.character(treated_dt[[v]])
+    xc <- as.character(control_dt[[v]])
+
+    wt <- treated_dt[[treated_weight_col]]
+    wc <- control_dt[[control_weight_col]]
+
+    lvls <- sort(unique(c(xt, xc)))
+    lvls <- lvls[!is.na(lvls)]
+
+    if (length(lvls) == 0) next
+
+    tmp <- lapply(lvls, function(lv) {
+      zt <- as.numeric(xt == lv)
+      zc <- as.numeric(xc == lv)
+
+      data.table(
+        sample = label,
+        covariate = v,
+        level = lv,
+        smd = smd_binary_weighted(zt, wt, zc, wc),
+        treated_mean = weighted_mean(zt, wt),
+        control_mean = weighted_mean(zc, wc)
       )
-      
-      # Outcome differences (Control − Treat)
-      matched_df[, `:=`(
-        PM10_diff = PM10 - PM10_target,
-        PM25_diff = PM25 - PM25_target
-      )]
-      
-      # Reconstruct *treated* rows that actually found controls
-      target_matched <- unique(matched_df[, .(target_index)])[
-        target_data_labeled, on = .(target_index)
-      ]
-      
-      # Final matched dataset = controls (with attached targets) + matched treated rows
-      final_matched_df <- rbindlist(list(
-        matched_df[, c(names(matched_df), "treated") := .(matched_df, 0L)][[]],
-        target_matched
-      ), use.names = TRUE, fill = TRUE)
-      
-      # ======================== Balance diagnostics ==========================
-      # Only use covariates that exist and vary in the (sub)samples
-      covariates <- intersect(covariates_all, names(final_matched_df))
-      setDT(final_matched_df)
-      
-      # After matching
-      if (!all(c("treated") %in% names(final_matched_df))) {
-        stop("`treated` column is missing in final_matched_df.")
+    })
+
+    out[[v]] <- rbindlist(tmp, use.names = TRUE, fill = TRUE)
+  }
+
+  if (length(out) == 0) return(data.table())
+
+  rbindlist(out, use.names = TRUE, fill = TRUE)
+}
+
+summarize_smd_by_variable <- function(smd_level_dt) {
+  if (nrow(smd_level_dt) == 0) return(data.table())
+
+  smd_level_dt[
+    ,
+    .(
+      max_abs_smd = suppressWarnings(max(smd, na.rm = TRUE)),
+      mean_abs_smd = suppressWarnings(mean(smd, na.rm = TRUE)),
+      n_levels = .N
+    ),
+    by = .(sample, covariate)
+  ][
+    !is.infinite(max_abs_smd)
+  ]
+}
+
+conventional_bootstrap_att <- function(delta_dt, outcomes, B, seed) {
+  set.seed(seed)
+
+  n <- nrow(delta_dt)
+  if (n == 0) {
+    stop("No matched treated observations available for bootstrap.", call. = FALSE)
+  }
+
+  boot_out <- vector("list", length(outcomes))
+  names(boot_out) <- outcomes
+
+  for (outcome in outcomes) {
+    delta_col <- paste0(outcome, "_diff")
+    delta <- delta_dt[[delta_col]]
+
+    if (all(is.na(delta))) {
+      boot_out[[outcome]] <- data.table(
+        outcome = outcome,
+        att = NA_real_,
+        boot_se = NA_real_,
+        ci_low = NA_real_,
+        ci_high = NA_real_,
+        n_boot = B
+      )
+      next
+    }
+
+    boot_stat <- replicate(
+      B,
+      mean(delta[sample.int(n, size = n, replace = TRUE)], na.rm = TRUE)
+    )
+
+    boot_out[[outcome]] <- data.table(
+      outcome = outcome,
+      att = mean(delta, na.rm = TRUE),
+      boot_se = sd(boot_stat, na.rm = TRUE),
+      ci_low = as.numeric(quantile(boot_stat, 0.025, na.rm = TRUE)),
+      ci_high = as.numeric(quantile(boot_stat, 0.975, na.rm = TRUE)),
+      n_boot = B
+    )
+  }
+
+  rbindlist(boot_out, use.names = TRUE, fill = TRUE)
+}
+
+load_q_data <- function(q, root_in) {
+  file_path <- file.path(root_in, sprintf("seoul_q%d.RData", q))
+
+  if (!file.exists(file_path)) {
+    stop(sprintf("Input file not found: %s", file_path), call. = FALSE)
+  }
+
+  env <- new.env()
+  load(file_path, envir = env)
+
+  obj_name <- sprintf("seoul_q%d", q)
+
+  if (!exists(obj_name, envir = env)) {
+    stop(
+      sprintf("Object `%s` not found inside %s", obj_name, file_path),
+      call. = FALSE
+    )
+  }
+
+  as.data.table(get(obj_name, envir = env))
+}
+
+prepare_data <- function(DT, q, cfg) {
+  DT <- copy(DT)
+
+  stop_if_missing(
+    DT,
+    vars = c("date", cfg$outcomes, "temp", "CO_quantile", "O3_quantile"),
+    data_name = sprintf("seoul_q%d", q)
+  )
+
+  DT[, date := safe_as_date(date)]
+
+  if (!("year" %in% names(DT))) {
+    DT[, year := as.integer(format(date, "%Y"))]
+  }
+
+  if (!("month" %in% names(DT))) {
+    DT[, month := as.integer(format(date, "%m"))]
+  }
+
+  if (!("day" %in% names(DT))) {
+    DT[, day := as.integer(format(date, "%d"))]
+  }
+
+  # No January-February filtering is applied here.
+  # The input data are assumed to be already restricted to January-February.
+
+  # Stable observation ID
+  setorder(DT, date)
+  DT[, obs_id := .I]
+
+  # Month-day key for cross-year calendar-window matching
+  DT[, month_day := format(date, "%m-%d")]
+
+  # Compatibility aliases
+  if (!("wind_sp_binary" %in% names(DT)) && ("wind_sp_ind" %in% names(DT))) {
+    DT[, wind_sp_binary := wind_sp_ind]
+  }
+
+  if (!("rain_binary" %in% names(DT)) && ("rain_indicator" %in% names(DT))) {
+    DT[, rain_binary := rain_indicator]
+  }
+
+  if (!("time_of_day" %in% names(DT))) {
+    stop_if_missing(DT, "hour", data_name = sprintf("seoul_q%d", q))
+
+    DT[
+      ,
+      time_of_day := fifelse(
+        hour >= 0 & hour < 6, "00-06",
+        fifelse(
+          hour >= 6 & hour < 12, "06-12",
+          fifelse(hour >= 12 & hour < 18, "12-18", "18-24")
+        )
+      )
+    ]
+  }
+
+  if (!("wday" %in% names(DT))) {
+    DT[, wday := weekdays(date)]
+  }
+
+  # Temperature is always matched using rounded temperature.
+  # This uses R's base round() function.
+  DT[, temp_round := round(temp)]
+
+  DT
+}
+
+get_match_vars <- function(region_var) {
+  c(
+    region_var,
+    "wday",
+    "time_of_day",
+    "CO_quantile",
+    "O3_quantile",
+    "wind_sp_binary",
+    "wind_dir_8",
+    "rain_binary",
+    "temp_round"
+  )
+}
+
+make_treated_window_table <- function(treated_key, d) {
+  by_cols <- names(treated_key)
+
+  treated_key[
+    ,
+    .(month_day = make_month_day_window(treated_date[1], d)),
+    by = by_cols
+  ]
+}
+
+# =============================================================================
+# 2. ONE CEM RUN
+# =============================================================================
+
+run_cem_one <- function(DT, q, region_var, d, cfg) {
+  message(
+    sprintf(
+      "\n[CEM] q=%d | region=%s | temp=round(temp) | window=±%d days",
+      q, region_var, d
+    )
+  )
+
+  match_vars <- get_match_vars(region_var)
+
+  required_vars <- unique(c(
+    "obs_id", "date", "year", "month_day",
+    cfg$outcomes,
+    match_vars
+  ))
+
+  stop_if_missing(DT, required_vars, data_name = sprintf("q%d data", q))
+
+  work <- copy(DT)
+
+  for (v in match_vars) {
+    work[, (v) := as.character(get(v))]
+  }
+
+  # ---------------------------------------------------------------------------
+  # 2.1 Define treated and control pools
+  # ---------------------------------------------------------------------------
+
+  treated <- work[
+    date >= cfg$treatment_start &
+      date <= cfg$treatment_end &
+      year == cfg$treatment_year
+  ]
+
+  controls <- work[
+    year != cfg$treatment_year
+  ]
+
+  if (nrow(treated) == 0) {
+    stop("No treated observations found.", call. = FALSE)
+  }
+
+  if (nrow(controls) == 0) {
+    stop("No control observations found.", call. = FALSE)
+  }
+
+  treated[, target_index := .I]
+
+  treated_key_cols <- c("target_index", "obs_id", "date", match_vars, cfg$outcomes)
+  treated_key <- treated[, ..treated_key_cols]
+
+  setnames(treated_key, "obs_id", "treated_obs_id")
+  setnames(treated_key, "date", "treated_date")
+  setnames(
+    treated_key,
+    old = cfg$outcomes,
+    new = paste0(cfg$outcomes, "_treated")
+  )
+
+  treated_window <- make_treated_window_table(treated_key, d)
+
+  control_cols <- unique(c("obs_id", "date", "year", "month_day", match_vars, cfg$outcomes))
+  controls_key <- controls[, ..control_cols]
+
+  setnames(controls_key, "obs_id", "control_obs_id")
+  setnames(controls_key, "date", "control_date")
+
+  # ---------------------------------------------------------------------------
+  # 2.2 CEM exact matching
+  # ---------------------------------------------------------------------------
+
+  join_vars <- c("month_day", match_vars)
+
+  matched_controls <- controls_key[
+    treated_window,
+    on = join_vars,
+    allow.cartesian = TRUE,
+    nomatch = 0
+  ]
+
+  if (nrow(matched_controls) == 0) {
+    warning(
+      sprintf(
+        "No matches: q=%d, region=%s, d=%d",
+        q, region_var, d
+      )
+    )
+    return(NULL)
+  }
+
+  matched_controls <- unique(
+    matched_controls,
+    by = c("target_index", "control_obs_id")
+  )
+
+  n_control_by_target <- matched_controls[
+    ,
+    .(
+      n_controls = .N,
+      n_unique_controls = uniqueN(control_obs_id)
+    ),
+    by = target_index
+  ]
+
+  matched_controls <- merge(
+    matched_controls,
+    n_control_by_target,
+    by = "target_index",
+    all.x = TRUE
+  )
+
+  # ---------------------------------------------------------------------------
+  # 2.3 Treated-level ATT contribution
+  # ---------------------------------------------------------------------------
+
+  control_means <- matched_controls[
+    ,
+    lapply(.SD, mean, na.rm = TRUE),
+    by = target_index,
+    .SDcols = cfg$outcomes
+  ]
+
+  setnames(
+    control_means,
+    old = cfg$outcomes,
+    new = paste0(cfg$outcomes, "_control_mean")
+  )
+
+  treated_cols <- c(
+    "target_index",
+    "treated_obs_id",
+    "treated_date",
+    match_vars,
+    paste0(cfg$outcomes, "_treated"),
+    "n_controls",
+    "n_unique_controls"
+  )
+
+  treated_matched <- unique(
+    matched_controls[, ..treated_cols],
+    by = "target_index"
+  )
+
+  treated_contrib <- merge(
+    treated_matched,
+    control_means,
+    by = "target_index",
+    all.x = TRUE
+  )
+
+  for (outcome in cfg$outcomes) {
+    treated_col <- paste0(outcome, "_treated")
+    control_col <- paste0(outcome, "_control_mean")
+    diff_col <- paste0(outcome, "_diff")
+
+    treated_contrib[
+      ,
+      (diff_col) := get(control_col) - get(treated_col)
+    ]
+  }
+
+  # ---------------------------------------------------------------------------
+  # 2.4 Conventional bootstrap over matched treated-level contrasts
+  # ---------------------------------------------------------------------------
+
+  boot_seed <- cfg$seed +
+    q * 10000L +
+    d * 100L +
+    match(region_var, cfg$region_vars) * 10L
+
+  boot_table <- conventional_bootstrap_att(
+    delta_dt = treated_contrib,
+    outcomes = cfg$outcomes,
+    B = cfg$B,
+    seed = boot_seed
+  )
+
+  boot_table[
+    ,
+    `:=`(
+      method = "CEM",
+      q = q,
+      region_var = region_var,
+      temp_var = "temp_round",
+      day_window = d,
+      n_treated_total = nrow(treated),
+      n_treated_matched = nrow(treated_contrib),
+      n_control_rows = nrow(matched_controls),
+      n_control_unique = uniqueN(matched_controls$control_obs_id)
+    )
+  ]
+
+  setcolorder(
+    boot_table,
+    c(
+      "method", "q", "region_var", "temp_var", "day_window", "outcome",
+      "att", "boot_se", "ci_low", "ci_high", "n_boot",
+      "n_treated_total", "n_treated_matched",
+      "n_control_rows", "n_control_unique"
+    )
+  )
+
+  # ---------------------------------------------------------------------------
+  # 2.5 SMD before and after matching
+  # ---------------------------------------------------------------------------
+
+  smd_covariates <- match_vars
+
+  # BEFORE:
+  # Treated observations vs controls eligible under the same ±d calendar window,
+  # before exact covariate matching.
+  eligible_window <- unique(
+    treated_window[, .(target_index, month_day)]
+  )
+
+  eligible_controls <- controls_key[
+    eligible_window,
+    on = "month_day",
+    allow.cartesian = TRUE,
+    nomatch = 0
+  ]
+
+  eligible_controls <- unique(
+    eligible_controls,
+    by = "control_obs_id"
+  )
+
+  before_treated <- treated[, c(smd_covariates), with = FALSE]
+  before_treated[, smd_weight := 1]
+
+  before_control <- eligible_controls[, c(smd_covariates), with = FALSE]
+  before_control[, smd_weight := 1]
+
+  smd_before_level <- compute_smd_categorical(
+    treated_dt = before_treated,
+    control_dt = before_control,
+    covariates = smd_covariates,
+    label = "before"
+  )
+
+  # AFTER:
+  # Treated weight = 1 per matched treated observation.
+  # Each control in a matched set receives weight 1 / n_controls_i.
+  after_treated <- treated_contrib[, c(smd_covariates), with = FALSE]
+  after_treated[, smd_weight := 1]
+
+  after_control <- matched_controls[, c(smd_covariates, "n_controls"), with = FALSE]
+  after_control[, smd_weight := 1 / n_controls]
+  after_control[, n_controls := NULL]
+
+  smd_after_level <- compute_smd_categorical(
+    treated_dt = after_treated,
+    control_dt = after_control,
+    covariates = smd_covariates,
+    label = "after"
+  )
+
+  smd_level <- rbindlist(
+    list(smd_before_level, smd_after_level),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  smd_variable <- summarize_smd_by_variable(smd_level)
+
+  if (nrow(smd_level) > 0) {
+    smd_level[
+      ,
+      `:=`(
+        method = "CEM",
+        q = q,
+        region_var = region_var,
+        temp_var = "temp_round",
+        day_window = d
+      )
+    ]
+  }
+
+  if (nrow(smd_variable) > 0) {
+    smd_variable[
+      ,
+      `:=`(
+        method = "CEM",
+        q = q,
+        region_var = region_var,
+        temp_var = "temp_round",
+        day_window = d
+      )
+    ]
+  }
+
+  list(
+    config = cfg,
+    q = q,
+    region_var = region_var,
+    temp_var = "temp_round",
+    day_window = d,
+    match_vars = match_vars,
+    matched_controls = matched_controls,
+    treated_contrib = treated_contrib,
+    att_bootstrap = boot_table,
+    smd_level = smd_level,
+    smd_variable = smd_variable
+  )
+}
+
+# =============================================================================
+# 3. SAVE FUNCTION
+# =============================================================================
+
+save_cem_result <- function(res, cfg) {
+  if (is.null(res)) return(invisible(NULL))
+
+  out_dir <- file.path(
+    cfg$root_out,
+    sprintf("region_%s", res$region_var),
+    sprintf("q%d", res$q)
+  )
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  tag <- sprintf(
+    "cem_%s_rt_q%d_d%d",
+    res$region_var,
+    res$q,
+    res$day_window
+  )
+
+  if (isTRUE(cfg$save_full_rds)) {
+    saveRDS(
+      res,
+      file = file.path(out_dir, paste0(tag, "_full_result.rds"))
+    )
+  } else {
+    light_res <- res
+    light_res$matched_controls <- NULL
+    saveRDS(
+      light_res,
+      file = file.path(out_dir, paste0(tag, "_result_no_matched_controls.rds"))
+    )
+  }
+
+  fwrite(
+    res$treated_contrib,
+    file = file.path(out_dir, paste0(tag, "_treated_contrib.csv"))
+  )
+
+  fwrite(
+    res$att_bootstrap,
+    file = file.path(out_dir, paste0(tag, "_att_bootstrap.csv"))
+  )
+
+  fwrite(
+    res$smd_level,
+    file = file.path(out_dir, paste0(tag, "_smd_by_level.csv"))
+  )
+
+  fwrite(
+    res$smd_variable,
+    file = file.path(out_dir, paste0(tag, "_smd_by_variable.csv"))
+  )
+
+  message(sprintf("[Saved] %s", out_dir))
+}
+
+# =============================================================================
+# 4. MAIN LOOP
+# =============================================================================
+
+all_att <- list()
+all_smd_variable <- list()
+
+for (q in cfg$q_values) {
+  message(sprintf("\n================ Loading q%d data ================", q))
+
+  DT_raw <- load_q_data(q, cfg$root_in)
+  DT <- prepare_data(DT_raw, q, cfg)
+
+  for (region_var in cfg$region_vars) {
+    if (!(region_var %in% names(DT))) {
+      warning(sprintf("Skipping region_var=%s because it is not in the data.", region_var))
+      next
+    }
+
+    for (d in cfg$day_windows) {
+      res <- run_cem_one(
+        DT = DT,
+        q = q,
+        region_var = region_var,
+        d = d,
+        cfg = cfg
+      )
+
+      if (!is.null(res)) {
+        save_cem_result(res, cfg)
+
+        key <- sprintf("%s_rt_q%d_d%d", region_var, q, d)
+        all_att[[key]] <- res$att_bootstrap
+        all_smd_variable[[key]] <- res$smd_variable
       }
-      # Keep covariates with >1 level in both groups
-      valid_cov_after <- covariates[
-        vapply(covariates, function(v) {
-          all(table(final_matched_df$treated, final_matched_df[[v]]) > 0) &&
-            length(unique(final_matched_df[[v]])) > 1
-        }, logical(1))
-      ]
-      
-      X_treat_after   <- get_dummy_matrix(final_matched_df[treated == 1], valid_cov_after)
-      X_control_after <- get_dummy_matrix(final_matched_df[treated == 0], valid_cov_after)
-      smd_after <- if (ncol(X_treat_after) && ncol(X_control_after)) {
-        sapply(intersect(names(X_treat_after), names(X_control_after)),
-               function(v) diff_smd(X_control_after[[v]], X_treat_after[[v]]))
-      } else numeric(0)
-      
-      # Before matching (full treated vs non-treated outside window)
-      unmatched_control <- seoul %>%
-        filter(!(date >= start_date & date <= end_date)) %>%
-        mutate(treated = 0L)
-      unmatched_treated <- target_data_labeled
-      
-      valid_cov_before <- intersect(covariates_all, names(unmatched_treated))
-      valid_cov_before <- intersect(valid_cov_before, names(unmatched_control))
-      valid_cov_before <- valid_cov_before[
-        vapply(valid_cov_before, function(v) {
-          (length(unique(unmatched_treated[[v]]))  > 1) &&
-            (length(unique(unmatched_control[[v]])) > 1)
-        }, logical(1))
-      ]
-      
-      X_treat_before   <- get_dummy_matrix(unmatched_treated,  valid_cov_before)
-      X_control_before <- get_dummy_matrix(unmatched_control, valid_cov_before)
-      smd_before <- if (ncol(X_treat_before) && ncol(X_control_before)) {
-        sapply(intersect(names(X_treat_before), names(X_control_before)),
-               function(v) diff_smd(X_control_before[[v]], X_treat_before[[v]]))
-      } else numeric(0)
-      
-      # =========================== Simple summaries ==========================
-      # ATT-like summaries (mean of Control − Treat differences over matched rows)
-      att_mean10 <- smean(matched_df$PM10_diff)
-      att_mean25 <- smean(matched_df$PM25_diff)
-      att_sd10   <- ssd(matched_df$PM10_diff)
-      att_sd25   <- ssd(matched_df$PM25_diff)
-      
-      # ================================ SAVE =================================
-      save_dir <- file.path(root_out, region_var)
-      if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
-      
-      save_path <- file.path(
-        save_dir,
-        sprintf("%s_%s_%s_%s_d%d.RData", file_prefix, region_var, unit_tag, q, day_window)
-      )
-      
-      # Package SMDs as named vectors for convenience
-      smd_before_vec <- smd_before
-      smd_after_vec  <- smd_after
-      
-      si <- utils::capture.output(sessionInfo())
-      save(matched_df, final_matched_df,
-           smd_before_vec, smd_after_vec,
-           att_mean10, att_mean25, att_sd10, att_sd25,
-           start_date, end_date, region_var, unit_tag, day_window, q, si,
-           file = save_path)
-      
-      message(sprintf("[Saved] %s", save_path))
-    } # day_window
-  }   # unit_tag
-}     # q
+    }
+  }
+}
 
+# =============================================================================
+# 5. GLOBAL SUMMARY FILES
+# =============================================================================
+
+if (length(all_att) > 0) {
+  att_all <- rbindlist(all_att, use.names = TRUE, fill = TRUE)
+
+  fwrite(
+    att_all,
+    file.path(cfg$root_out, "cem_all_att_bootstrap_summary.csv")
+  )
+
+  message(
+    sprintf(
+      "[Saved] %s",
+      file.path(cfg$root_out, "cem_all_att_bootstrap_summary.csv")
+    )
+  )
+}
+
+if (length(all_smd_variable) > 0) {
+  smd_all <- rbindlist(all_smd_variable, use.names = TRUE, fill = TRUE)
+
+  fwrite(
+    smd_all,
+    file.path(cfg$root_out, "cem_all_smd_variable_summary.csv")
+  )
+
+  smd_plot_all <- copy(smd_all)
+  setnames(smd_plot_all, "sample", "stage")
+  setnames(smd_plot_all, "max_abs_smd", "SMD")
+
+  smd_plot_all <- smd_plot_all[
+    ,
+    .(
+      method,
+      q,
+      region_var,
+      temp_var,
+      day_window,
+      covariate,
+      stage,
+      SMD,
+      mean_abs_smd,
+      n_levels
+    )
+  ]
+
+  fwrite(
+    smd_plot_all,
+    file.path(cfg$root_out, "cem_all_smd_plot_summary.csv")
+  )
+
+  message(
+    sprintf(
+      "[Saved] %s",
+      file.path(cfg$root_out, "cem_all_smd_variable_summary.csv")
+    )
+  )
+
+  message(
+    sprintf(
+      "[Saved] %s",
+      file.path(cfg$root_out, "cem_all_smd_plot_summary.csv")
+    )
+  )
+}
+
+message("\nCEM matching + conventional bootstrap completed.")
