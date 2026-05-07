@@ -583,20 +583,23 @@ run_cem_one <- function(DT, q, region_var, d, cfg) {
   )
   
   # AFTER:
-  # Treated weight = 1 per matched treated observation.
-  # Each control in a matched set receives weight 1 / n_controls_i.
   after_treated <- treated_contrib[, c(smd_covariates), with = FALSE]
   after_treated[, smd_weight := 1]
   
-  after_control <- matched_controls[, c(smd_covariates, "n_controls"), with = FALSE]
-  after_control[, smd_weight := 1 / n_controls]
-  after_control[, n_controls := NULL]
+  after_control <- matched_controls[, c(smd_covariates), with = FALSE]
+  after_control[, smd_weight := 1]
   
   smd_after_level <- compute_smd_categorical(
     treated_dt = after_treated,
     control_dt = after_control,
     covariates = smd_covariates,
     label = "after"
+  )
+  
+  smd_level <- rbindlist(
+    list(smd_before_level, smd_after_level),
+    use.names = TRUE,
+    fill = TRUE
   )
   
   smd_level <- rbindlist(
