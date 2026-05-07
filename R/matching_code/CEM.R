@@ -10,14 +10,6 @@
 #           for each treated observation i,
 #           find controls j with |t_j - t_i| <= d and year(j) != 2020,
 #           then exact match on coarsened covariates X_i^(q) = X_j^(q).
-#
-# Important:
-#           - Observational unit: district-date-hour record
-#           - Matching temporal covariate: time_of_day, not exact hour
-#           - Temperature matching covariate: temp_round = round(temp)
-#           - Wind speed covariate: wind_sp_ind
-#           - Variables such as wday, time_of_day, rain_binary, wind_sp_ind
-#             are assumed to already exist in the input data.
 ###############################################################################
 
 suppressPackageStartupMessages({
