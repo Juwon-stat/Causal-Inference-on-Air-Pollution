@@ -19,7 +19,7 @@ This repository contains R code and materials for causal inference analysis of a
 
 - **Balance diagnostics**  
   - Standardized Mean Difference (SMD) calculation  
-  - Panel visualization (Love plots, 2×3 and 3×3 panels)  
+  - Panel visualization (Love plots, 3×3 panels)  
   - CSV exports of summarized balance tables  
 
 ## ⚙️ Requirements
