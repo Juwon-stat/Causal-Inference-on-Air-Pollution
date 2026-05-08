@@ -1,6 +1,5 @@
-# Block-wise Intertemporal Matching
-
-**Causal Inference on Transboundary Air Pollution: Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality**
+# Block-wise Intertemporal Matching for Causal Inference on Meteorological Data
+## : Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality**
 
 This repository provides the full reproducible R code and analysis materials for a methodological causal inference study on transboundary air pollution. The study develops and applies a **block-wise intertemporal matching framework** to estimate the causal impact of upstream lockdown-related emission reductions on downstream particulate matter concentrations in Seoul.
 
