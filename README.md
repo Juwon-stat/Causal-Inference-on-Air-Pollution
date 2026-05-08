@@ -142,6 +142,6 @@ Additional packages may be required depending on the specific matching or plotti
 
 This repository accompanies the methodological paper:
 
-**Causal Inference on Transboundary Air Pollution: Quantifying the Impact of Upwind Lockdowns on Downwind Air Quality**
+**Block-wise Intertemporal Matching for Causal Inference on Meteorological Data**
 
 Please cite the paper when using this repository or adapting the code.
