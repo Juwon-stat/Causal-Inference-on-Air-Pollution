@@ -68,8 +68,6 @@ The `R/smd_code/` directory contains code for producing balance diagnostic outpu
 
 This includes:
 
-- SMD calculation before and after matching
-- bootstrap-based balance summaries
 - Love plots
 - method-specific SMD plots
 - combined panel plots comparing CEM, PSM, and CBPS
